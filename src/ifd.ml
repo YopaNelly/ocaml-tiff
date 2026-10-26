@@ -17,8 +17,7 @@ let read_header ro =
     match Cstruct.to_string ~off:0 ~len:2 buf with
     | "II" -> Endian.Little
     | "MM" -> Endian.Big
-    | e ->
-        Error.raisef Error.Malformed_file "Unknown endianness of TIFF file %s" e
+    | e -> failwith ("Unknown endianness of TIFF file " ^ e)
   in
   let magic = Endian.uint16 ~offset:2 byte_order buf in
   let kind, offset =
@@ -28,7 +27,7 @@ let read_header ro =
     | 43 ->
         ( Bigtiff,
           Endian.uint64 ~offset:8 byte_order buf |> Optint.Int63.of_int64 )
-    | i -> Error.raisef Error.Malformed_file "Unknown magic number: %d" i
+    | i -> failwith ("Unknown magic number: " ^ string_of_int i)
   in
   { byte_order; kind; offset }
 
@@ -93,7 +92,7 @@ let field_of_int = function
   | 16 -> Long8
   | 17 -> Slong8
   | 18 -> Ifd8
-  | n -> Error.raisef Error.Malformed_file "Field kind %d" n
+  | n -> invalid_arg ("Field kind " ^ string_of_int n)
 
 let field_to_int = function
   | Byte -> 1
@@ -470,8 +469,8 @@ let get_immediate e =
   match e.offset with
   | Immediate i -> i
   | off ->
-      Error.raisef Error.Invalid_argument
-        "Tried to coerce a non-immediate value (%a)." pp_offset off
+      Fmt.invalid_arg "Tried to coerce a non-immediate value (%a)." pp_offset
+        off
 
 let read_entry e =
   match e.field with
@@ -479,8 +478,8 @@ let read_entry e =
   | Long -> get_immediate e |> Int64.to_int
   | Long8 -> get_immediate e |> Int64.to_int
   | _ ->
-      Error.raisef Error.Malformed_file "Bad entry for short read: %a" pp_entry
-        e
+      raise
+        (Invalid_argument (Fmt.str "Bad entry for short read: %a" pp_entry e))
 
 let height e = lookup_exn e.entries ImageLength |> read_entry
 let width e = lookup_exn e.entries ImageWidth |> read_entry
@@ -510,9 +509,7 @@ let get_dataset_offsets endian entries reader =
       | Short -> Endian.uint16 ~offset endian buf
       | Long -> Endian.uint32 ~offset endian buf |> Int32.to_int
       | Long8 -> Endian.uint64 ~offset endian buf |> Int64.to_int
-      | _ ->
-          Error.raise_error Error.Unsupported_feature
-            "Unsupported strip offset field type"
+      | _ -> Fmt.failwith "Unsupported"
     in
     for i = 0 to strip_count - 1 do
       strips :=
@@ -530,8 +527,8 @@ let get_dataset_offsets endian entries reader =
         | Long -> 4
         | Long8 -> 8
         | _ ->
-            Error.raisef Error.Unsupported_feature
-              "Unsupported strip length: %a" pp_field strip_offsets.field
+            Fmt.failwith "Unsupported strip length: %a" pp_field
+              strip_offsets.field
       in
       match strip_offsets.offset with
       | Immediate _ -> [ read_entry strip_offsets ]
@@ -544,7 +541,7 @@ let get_dataset_offsets endian entries reader =
       | Read (_o, [ buf ]) ->
           read_strips ~strip_count ~strip_bytes ~strip_offsets buf
       | Read _ ->
-          Error.raise_error Error.Internal_error
+          Fmt.invalid_arg
             "Reading data offsets: impossible number of strip buffers")
 
 let get_bytecounts endian entries reader =
@@ -555,8 +552,8 @@ let get_bytecounts endian entries reader =
       | Long -> Endian.uint32 ~offset endian buf |> Int32.to_int
       | Long8 -> Endian.uint64 ~offset endian buf |> Int64.to_int
       | _ ->
-          Error.raisef Error.Unsupported_feature "Unsupported strip length: %a"
-            pp_field strip_offsets.field
+          Fmt.failwith "Unsupported strip length: %a" pp_field
+            strip_offsets.field
     in
     for i = 0 to strip_count - 1 do
       strips :=
@@ -574,8 +571,8 @@ let get_bytecounts endian entries reader =
         | Long -> 4
         | Long8 -> 8
         | _ ->
-            Error.raisef Error.Unsupported_feature
-              "Unsupported strip length: %a" pp_field strip_offsets.field
+            Fmt.failwith "Unsupported strip length: %a" pp_field
+              strip_offsets.field
       in
       match strip_offsets.offset with
       | Immediate _ -> [ read_entry strip_offsets ]
@@ -588,7 +585,7 @@ let get_bytecounts endian entries reader =
       | Read (_o, [ buf ]) ->
           read_bytecounts ~strip_bytes ~strip_offsets ~strip_count buf
       | Read _ ->
-          Error.raise_error Error.Internal_error
+          Fmt.invalid_arg
             "Reading data offsets: impossible number of strip buffers")
 
 let max_group lst n =
@@ -646,37 +643,40 @@ let document_name t =
   String.sub s 0 (String.length s - 1)
 
 let bits_per_sample t =
-  let entry = lookup_exn t.entries BitsPerSample in
-  match entry.offset with
-  | Immediate imm ->
-      if entry.count = 1L then [ Int64.to_int imm ]
-      else if entry.count = 2L then (
-        let buf = Cstruct.create 8 in
-        Cstruct.BE.set_uint64 buf 0 imm;
-        [ Cstruct.BE.get_uint16 buf 0; Cstruct.BE.get_uint16 buf 2 ])
-      else if entry.count = 3L && t.header.kind = Bigtiff then (
-        let buf = Cstruct.create 8 in
-        Cstruct.BE.set_uint64 buf 0 imm;
-        [
-          Cstruct.BE.get_uint16 buf 2;
-          Cstruct.BE.get_uint16 buf 2;
-          Cstruct.BE.get_uint16 buf 4;
-        ])
-      else if entry.count = 4L && t.header.kind = Bigtiff then (
-        let buf = Cstruct.create 8 in
-        Cstruct.BE.set_uint64 buf 0 imm;
-        [
-          Cstruct.BE.get_uint16 buf 2;
-          Cstruct.BE.get_uint16 buf 2;
-          Cstruct.BE.get_uint16 buf 4;
-          Cstruct.BE.get_uint16 buf 6;
-        ])
-      else
-        let scales = read_entry_raw entry t.ro in
-        List.map (Endian.uint16 t.header.byte_order) scales
-  | _ ->
-      let scales = read_entry_raw entry t.ro in
-      List.map (Endian.uint16 t.header.byte_order) scales
+  let entry_opt = lookup t.entries BitsPerSample in
+  match entry_opt with
+  | None -> [ 1 ] (* TIFF 6.0 default when the tag is absent *)
+  | Some entry -> (
+      match entry.offset with
+      | Immediate imm ->
+          if entry.count = 1L then [ Int64.to_int imm ]
+          else if entry.count = 2L then (
+            let buf = Cstruct.create 8 in
+            Cstruct.BE.set_uint64 buf 0 imm;
+            [ Cstruct.BE.get_uint16 buf 0; Cstruct.BE.get_uint16 buf 2 ])
+          else if entry.count = 3L && t.header.kind = Bigtiff then (
+            let buf = Cstruct.create 8 in
+            Cstruct.BE.set_uint64 buf 0 imm;
+            [
+              Cstruct.BE.get_uint16 buf 2;
+              Cstruct.BE.get_uint16 buf 2;
+              Cstruct.BE.get_uint16 buf 4;
+            ])
+          else if entry.count = 4L && t.header.kind = Bigtiff then (
+            let buf = Cstruct.create 8 in
+            Cstruct.BE.set_uint64 buf 0 imm;
+            [
+              Cstruct.BE.get_uint16 buf 2;
+              Cstruct.BE.get_uint16 buf 2;
+              Cstruct.BE.get_uint16 buf 4;
+              Cstruct.BE.get_uint16 buf 6;
+            ])
+          else
+            let scales = read_entry_raw entry t.ro in
+            List.map (Endian.uint16 t.header.byte_order) scales
+      | _ ->
+          let scales = read_entry_raw entry t.ro in
+          List.map (Endian.uint16 t.header.byte_order) scales)
 
 let planar_configuration t =
   try
@@ -795,7 +795,7 @@ module GeoKeys = struct
     | 9106 -> Gon
     | 9107 -> DMS
     | 9108 -> DMS_hemisphere
-    | i -> Error.raisef Error.Unsupported_feature "Unknown angular units: %d" i
+    | _ -> failwith "Unknown angular units"
 
   let angular_units_to_string = function
     | Radian -> "radian"
@@ -847,7 +847,7 @@ module GeoKeys = struct
         in
         let geo_entries = loop [] rest in
         { version; revision; minor; geo_entries }
-    | _ -> Error.raise_error Error.Malformed_file "GeoKeyDirectory Malformed!"
+    | _ -> invalid_arg "GeoKeyDirectory Malformed!"
 
   let get_geo_entries t = t.geo_entries
 
@@ -892,9 +892,7 @@ module GeoKeys = struct
     | `Loc i -> (
         match tag_of_int i with
         | GeoDoubleParams -> (geo_double_params t).(Int64.to_int key.offset)
-        | _ ->
-            Error.raise_error Error.Malformed_file
-              "Unknown location of semi major axis double")
+        | _ -> failwith "Unknown location of semi major axis double")
 
   let inv_flattening t e =
     let key = lookup_key_exn e.geo_entries GeogInvFlatteningGeoKey in
@@ -903,9 +901,7 @@ module GeoKeys = struct
     | `Loc i -> (
         match tag_of_int i with
         | GeoDoubleParams -> (geo_double_params t).(Int64.to_int key.offset)
-        | _ ->
-            Error.raise_error Error.Malformed_file
-              "Unknown location of semi major axis double")
+        | _ -> failwith "Unknown location of semi major axis double")
 end
 
 let geo_key_directory t = GeoKeys.entries t
@@ -1132,7 +1128,7 @@ let write_ifd ~file_offset header writer (ifd : t) =
                 (Optint.Int63.to_int32 off);
               write_entry entry writer
           | off, _ ->
-              Error.raisef Error.Internal_error
+              Fmt.invalid_arg
                 "Writing a non-immediate offset with no values: %a" pp_offset
                 off)
       | Bigtiff -> (
@@ -1153,7 +1149,7 @@ let write_ifd ~file_offset header writer (ifd : t) =
                 (Optint.Int63.to_int64 off);
               write_entry entry writer
           | off, _ ->
-              Error.raisef Error.Internal_error
+              Fmt.invalid_arg
                 "Writing a non-immediate offset with no values: %a" pp_offset
                 off))
     ifd.entries;
@@ -1250,9 +1246,7 @@ let make_entry_raw field endian values =
           | Long -> Endian.set_uint32 ~offset:0 endian buf (Int32.of_int v)
           | Long8 -> Endian.set_uint64 ~offset:0 endian buf (Int64.of_int v)
           | Byte -> Cstruct.set_uint8 buf 0 v
-          | _ ->
-              Error.raisef Error.Unsupported_feature
-                "Unsupported field type: %a" pp_field field);
+          | _ -> failwith "Unsupported field type");
           buf)
         vals
   | Doubles vals ->
@@ -1261,9 +1255,7 @@ let make_entry_raw field endian values =
           let buf = Cstruct.create byte_size in
           (match field with
           | Double -> Endian.set_double ~offset:0 endian buf v
-          | _ ->
-              Error.raisef Error.Unsupported_feature
-                "Unsupported field type: %a" pp_field field);
+          | _ -> failwith "Unsupported field type");
           buf)
         vals
   | String s -> (
@@ -1274,12 +1266,8 @@ let make_entry_raw field endian values =
               let buf = Cstruct.create byte_size in
               Cstruct.set_char buf 0 s.[i];
               buf)
-      | _ ->
-          Error.raisef Error.Unsupported_feature "Unsupported field type: %a"
-            pp_field field)
-  | _ ->
-      Error.raisef Error.Unsupported_feature "Unsupported field type: %a"
-        pp_field field
+      | _ -> failwith "Unsupported field type")
+  | _ -> failwith "Unsupported field type"
 
 let make_entry endian file_offset tag values =
   let count =
@@ -1294,13 +1282,11 @@ let make_entry endian file_offset tag values =
   let field =
     match allowed_fields with
     | [ field ] -> field
-    | [] -> Error.raise_error Error.Unsupported_feature "Unknown field for tag"
+    | [] -> failwith "Unknown field for tag"
     | _ -> (
         match values with
         | Ints (v :: _) -> smallest_int_field_for v allowed_fields
-        | _ ->
-            Error.raise_error Error.Unsupported_feature
-              "Cannot determine field for non-int multi-field tag")
+        | _ -> failwith "Cannot determine field for non-int multi-field tag")
   in
   let is_immediate = is_immediate_raw ~count field in
   let offset =
